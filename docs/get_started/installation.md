@@ -14,6 +14,8 @@ source installer below.
 
 > **Ascend NPU?** See [Installation — Ascend NPU](./installation_npu.md) for the supported software stack, prerequisites, and installation helper.
 
+> **Jetson AGX Thor?** See [Installation — Jetson AGX Thor](./installation_jetson_thor.md) for the experimental Qwen3-ASR container path validated on ARM64/SM110.
+
 ## 🐳 Option A: Docker (recommended)
 
 **1. Pull the image**

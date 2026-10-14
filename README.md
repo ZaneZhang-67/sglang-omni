@@ -60,6 +60,7 @@ SGLang-Omni is a multi-stage serving runtime for omni, speech, and TTS models. I
 | Backend | Status | Notes |
 |---------|--------|-------|
 | **NVIDIA CUDA** | Supported | Default backend with full model coverage. |
+| **Jetson AGX Thor** | Experimental | ARM64/SM110 container path validated with Qwen3-ASR 1.7B. See the [Thor installation guide](./docs/get_started/installation_jetson_thor.md). |
 | **Apple Silicon** | Experimental | Qwen3-ASR runs through native MLX or Torch MPS on macOS arm64. Install with [`install.sh`](./install.sh) and follow the [Qwen3-ASR guide](./docs/cookbook/qwen3_asr.md#apple-silicon-mlx). |
 | **Intel GPU (XPU)** | Experimental | Intel Arc GPUs via PyTorch XPU. **Qwen3-ASR, Qwen3-TTS, ZONOS2, and Qwen3-Omni serve end-to-end** (ZONOS2 with decode graphs; Omni thinker via multi-XPU tensor parallelism). Install per [Intel XPU guide](./docs/get_started/installation_xpu.md); the backend is auto-detected. |
 

@@ -92,6 +92,7 @@ Supported Models
    :caption: Get Started
 
    get_started/installation.md
+   get_started/installation_jetson_thor.md
    get_started/installation_npu.md
    get_started/installation_xpu.md
    get_started/installation_cpu.md
