@@ -116,8 +116,11 @@ def test_the_compiled_chunk_mask_matches_eager(static_chunk_size: int) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_production_packed_dit_compile_is_as_close_to_float32_as_eager() -> None:
-    if not _is_fa3_supported():
+@pytest.mark.parametrize("attention_backend", ["auto", "flashinfer_fa2"])
+def test_production_packed_dit_compile_is_as_close_to_float32_as_eager(
+    attention_backend: str,
+) -> None:
+    if attention_backend == "auto" and not _is_fa3_supported():
         pytest.skip("FA3 is unavailable on this device")
 
     torch.manual_seed(3)
@@ -148,7 +151,7 @@ def test_production_packed_dit_compile_is_as_close_to_float32_as_eager() -> None
             module.to(torch.bfloat16)
         else:
             pass
-    estimator = PackedDiT(dit, device="cuda")
+    estimator = PackedDiT(dit, device="cuda", attention_backend=attention_backend)
     assert estimator.is_ragged
     reference = PackedDiT(copy.deepcopy(dit).float(), device="cuda")
     t = torch.full((1,), 0.37, device="cuda", dtype=torch.bfloat16)

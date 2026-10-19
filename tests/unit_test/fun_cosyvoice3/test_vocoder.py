@@ -894,15 +894,22 @@ def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> Non
     monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "/checkpoint")
     monkeypatch.setattr(stages, "patch_chunk_mask", lambda: None)
 
-    def fake_load(checkpoint_dir, device, fp16, **kwargs):
+    def fake_load(
+        checkpoint_dir: str,
+        device: str,
+        fp16: bool,
+        *,
+        autocast_dtype: torch.dtype | None,
+        enable_flow_estimator_trt: bool,
+        flow_attention_backend: str,
+    ) -> tuple[RunnableFakeFlow, FakeHiFT]:
         captured.update(
             {
                 "checkpoint_dir": checkpoint_dir,
                 "device": device,
                 "fp16": fp16,
-                "enable_flow_estimator_trt": kwargs.get(
-                    "enable_flow_estimator_trt", False
-                ),
+                "enable_flow_estimator_trt": enable_flow_estimator_trt,
+                "flow_attention_backend": flow_attention_backend,
             }
         )
         return fake_flow, fake_hift
@@ -923,6 +930,8 @@ def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> Non
         flow_batch_admission_frames=200,
         flow_merge_max_gap_frames=0,
         flow_merge_pad_budget_percent=0,
+        flow_attention_backend="sdpa",
+        enable_flow_cuda_graph=False,
     )
 
     assert isinstance(scheduler, FunCosyVoice3StreamingVocoderScheduler)
@@ -940,6 +949,7 @@ def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> Non
         "device": "cpu",
         "fp16": True,
         "enable_flow_estimator_trt": False,
+        "flow_attention_backend": "sdpa",
     }
 
 
@@ -997,13 +1007,23 @@ def prepare_vocoder_startup(
     )
     monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "/checkpoint")
     monkeypatch.setattr(stages, "patch_chunk_mask", lambda: None)
+
+    def load_flow(
+        checkpoint_dir: str,
+        device: str,
+        fp16: bool,
+        *,
+        autocast_dtype: torch.dtype | None,
+        enable_flow_estimator_trt: bool,
+        flow_attention_backend: str,
+    ) -> tuple[GraphRunnableFakeFlow, FakeHiFT]:
+        assert flow_attention_backend == "auto"
+        return fake_flow, FakeHiFT()
+
     monkeypatch.setattr(
         stages,
         "load_cosyvoice3_flow_hift",
-        lambda checkpoint_dir, device, fp16, autocast_dtype, enable_flow_estimator_trt=False: (
-            fake_flow,
-            FakeHiFT(),
-        ),
+        load_flow,
     )
 
     def record_native_compile(flow, autocast_dtype: torch.dtype | None) -> None:
@@ -1485,9 +1505,7 @@ def test_vocoder_spectra_match_cosyvoice_without_a_host_wait(
     phase = (torch.rand(3, 9, 1201, device="cuda") * 2 - 1) * torch.pi
     with torch.inference_mode():
         references = (
-            *reference_hift._stft(
-                waveforms
-            ),  # noqa: leading-underscore  # upstream name
+            *reference_hift._stft(waveforms),  # noqa: leading-underscore  # upstream name
             reference_hift._istft(  # noqa: leading-underscore  # upstream name
                 magnitude, phase
             ),

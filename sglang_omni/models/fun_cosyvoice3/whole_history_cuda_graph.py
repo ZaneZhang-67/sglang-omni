@@ -11,7 +11,9 @@ from dataclasses import dataclass
 import torch
 
 from sglang_omni.models.fun_cosyvoice3.packed_dit import (
+    FlashInferAttentionRunner,
     PackedDiT,
+    PackedRowAttention,
     PackedRows,
     pack_rows,
     solve_flow_euler_packed,
@@ -30,6 +32,8 @@ class CapturedWholeHistorySolve:
     speaker_embeddings: torch.Tensor
     mel_conditioning: torch.Tensor
     twin_rows: PackedRows
+    attention: PackedRowAttention
+    flashinfer_runner: FlashInferAttentionRunner | None
     output: torch.Tensor
 
 
@@ -81,10 +85,18 @@ class WholeHistoryCudaGraphRunner:
                 twin_rows = pack_rows(
                     self.slot_lengths([], tier_frames) * 2, self.device
                 )
+                flashinfer_runner = (
+                    self.estimator.flashinfer_runner.cuda_graph_runner()
+                    if self.estimator.flashinfer_runner is not None
+                    else None
+                )
                 # note (ratish): captured over one padding row as wide as the tier, so the
                 # baked widest row bounds every replay.
                 attention = self.estimator.row_attention(
-                    twin_rows, streaming=False, dtype=self.speaker_dtype
+                    twin_rows,
+                    streaming=False,
+                    dtype=self.speaker_dtype,
+                    flashinfer_runner=flashinfer_runner,
                 )
                 noise = torch.zeros(
                     1,
@@ -130,6 +142,8 @@ class WholeHistoryCudaGraphRunner:
                         speaker_embeddings=speaker_embeddings,
                         mel_conditioning=mel_conditioning,
                         twin_rows=twin_rows,
+                        attention=attention,
+                        flashinfer_runner=flashinfer_runner,
                         output=output,
                     )
                 )
@@ -175,6 +189,10 @@ class WholeHistoryCudaGraphRunner:
             (static.conv_output_index, twin_rows.conv_output_index),
         ):
             destination.copy_(source)
+        if captured.flashinfer_runner is not None:
+            captured.flashinfer_runner.update_ragged(cu_seqlens=twin_rows.starts)
+        else:
+            pass
         captured.graph.replay()
         # note (ratish): the next replay of any solve graph overwrites the shared pool.
         return captured.output[:, :frame_count].clone()

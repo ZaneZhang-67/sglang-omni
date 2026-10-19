@@ -67,6 +67,9 @@ class PrefixCudaGraphRunner:
         self.euler_steps = len(pool.keys)
         self.mel_channels = mel_channels
         self.speaker_channels = speaker_channels
+        attention = estimator.dit.transformer_blocks[0].attn
+        self.heads = attention.heads
+        self.head_dim = attention.inner_dim // attention.heads
         self.tier_frames = [rows * hop_frames for rows in row_tiers(max_rows)]
         chunk_size = estimator.chunk_size
         self.layouts: list[PrefixStepLayout] = []
@@ -91,6 +94,11 @@ class PrefixCudaGraphRunner:
         hidden_size = self.estimator.dit.input_embed.proj.out_features
         with self.graphs.capture_session("prefix", self.tier_frames):
             for layout in reversed(self.layouts):
+                flashinfer_runner = (
+                    self.estimator.flashinfer_runner.cuda_graph_runner()
+                    if self.estimator.flashinfer_runner is not None
+                    else None
+                )
                 attention = PrefixRowAttention(
                     rows=[],
                     new_frames=[],
@@ -98,6 +106,10 @@ class PrefixCudaGraphRunner:
                     padding_block=self.pool.padding_block,
                     chunk_size=self.estimator.chunk_size,
                     device=self.device,
+                    flashinfer_runner=flashinfer_runner,
+                    heads=self.heads,
+                    head_dim=self.head_dim,
+                    dtype=self.speaker_dtype,
                 )
                 if self.pool.forward is not forward_prefix:
                     attention.mark_dynamic()
@@ -246,6 +258,14 @@ class PrefixCudaGraphRunner:
             (static.page_table[:, :page_table_width], attention.page_table),
         ):
             destination.copy_(source)
+        if static.flashinfer_runner is not None:
+            static.flashinfer_runner.update_paged(
+                cu_seqlens_q=attention.cu_seqlens_q,
+                cache_seqlens=attention.cache_seqlens,
+                page_table=attention.page_table,
+            )
+        else:
+            pass
         captured.graph.replay()
         # note (ratish): the next replay of any solve graph overwrites the shared pool.
         generated = captured.output[:, :frame_count].clone()

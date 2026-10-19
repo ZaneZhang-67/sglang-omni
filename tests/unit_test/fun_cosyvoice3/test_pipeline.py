@@ -155,6 +155,7 @@ def test_fun_cosyvoice3_config_and_registry_contract() -> None:
         "enable_flow_whole_history_cuda_graph": True,
         "enable_hift_cuda_graph": True,
         "enable_flow_estimator_trt": False,
+        "flow_attention_backend": "auto",
         "token_hop_len": 25,
         "token_max_hop_len": 100,
         "disable_hop_growth": False,
@@ -204,6 +205,16 @@ def test_fun_cosyvoice3_rejects_explicit_tensorrt_and_dit_compile() -> None:
                 "vocoder.factory.enable_dit_torch_compile": True,
             }
         )
+
+
+def test_fun_cosyvoice3_flashinfer_accepts_cuda_graph_defaults() -> None:
+    merged = ConfigManager(
+        FunCosyVoice3PipelineConfig(model_path="model")
+    ).merge_config({"vocoder.factory.flow_attention_backend": "flashinfer_fa2"})
+    vocoder = next(stage for stage in merged.stages if stage.name == "vocoder")
+    assert vocoder.factory.model_extra["flow_attention_backend"] == "flashinfer_fa2"
+    assert vocoder.factory.model_extra["enable_flow_prefix_cuda_graph"]
+    assert vocoder.factory.model_extra["enable_flow_whole_history_cuda_graph"]
 
 
 def test_fun_cosyvoice3_state_round_trip_preserves_wire_contract() -> None:

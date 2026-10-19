@@ -140,6 +140,7 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
                 # CUDA Graph and DiT torch.compile are on by default. TensorRT stays opt-in;
                 # stage_factory_kwargs sets the compile default.
                 enable_flow_estimator_trt=False,
+                flow_attention_backend="auto",
                 token_hop_len=25,
                 token_max_hop_len=100,
                 disable_hop_growth=False,

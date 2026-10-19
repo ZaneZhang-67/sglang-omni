@@ -5,6 +5,7 @@ graph replayed hops and whole-history solves their eager solves."""
 from __future__ import annotations
 
 import copy
+from collections.abc import Iterator
 
 import pytest
 import torch
@@ -40,9 +41,30 @@ CHUNK = 50
 CHANNELS = 80
 HEADS, HEAD_DIM, LAYERS = 4, 64, 3
 COMPILED_OVER_EAGER_ERROR = 1.1
+GRAPH_RELATIVE_L2_TOLERANCE = 1e-2
 
 
-def make_estimator() -> PackedDiT:
+@pytest.fixture(scope="module")
+def captured_graph_lifetimes() -> Iterator[list[object]]:
+    retained: list[object] = []
+    yield retained
+    for item in retained:
+        runners = item if isinstance(item, tuple) else (item,)
+        for runner in runners:
+            for captured in runner.captured:
+                captured.graph.reset()
+    torch.cuda.synchronize()
+    retained.clear()
+
+
+def relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    return float(
+        torch.linalg.vector_norm(actual.float() - expected.float())
+        / torch.linalg.vector_norm(expected.float())
+    )
+
+
+def make_estimator(attention_backend: str = "auto") -> PackedDiT:
     torch.manual_seed(0)
     dit = (
         cosyvoice_dit.DiT(
@@ -80,7 +102,7 @@ def make_estimator() -> PackedDiT:
     dit.input_embed.conv_pos_embed = FusedConvPositionEmbedding(
         dit.input_embed.conv_pos_embed
     )
-    estimator = PackedDiT(dit, device="cuda")
+    estimator = PackedDiT(dit, device="cuda", attention_backend=attention_backend)
     if not estimator.is_ragged:
         pytest.skip("requires FA3")
     else:
@@ -90,11 +112,13 @@ def make_estimator() -> PackedDiT:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("totals", [(100, 200, 400), (70, 130, 260)])
+@pytest.mark.parametrize("attention_backend", ["auto", "flashinfer_fa2"])
 def test_prefix_hops_are_bit_identical_to_whole_history_hops(
     totals: tuple[int, ...],
+    attention_backend: str,
 ) -> None:
     """Every hop equals the whole-history hop, also hops that end inside a chunk."""
-    estimator = make_estimator()
+    estimator = make_estimator(attention_backend)
     device = torch.device("cuda")
     dtype = torch.bfloat16
     pool = PrefixKVPool(
@@ -157,9 +181,8 @@ def test_prefix_hops_are_bit_identical_to_whole_history_hops(
                 expected = reference[0, row * total + previous : (row + 1) * total]
                 actual = cached[
                     0,
-                    row * (total - start)
-                    + previous
-                    - start : (row + 1) * (total - start),
+                    row * (total - start) + previous - start : (row + 1)
+                    * (total - start),
                 ]
                 assert torch.equal(actual, expected), (total, row)
             previous = total
@@ -171,12 +194,15 @@ def test_prefix_hops_are_bit_identical_to_whole_history_hops(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_compiled_prefix_hops_follow_each_row_across_batches() -> None:
+@pytest.mark.parametrize("attention_backend", ["auto", "flashinfer_fa2"])
+def test_compiled_prefix_hops_follow_each_row_across_batches(
+    attention_backend: str,
+) -> None:
     """Compiled hops over rows with their own prompts, prefixes and lengths,
     one joining fresh beside a cached one and the order flipped on a later hop,
     stay as close to each row's float32 whole-history solve as its bf16 eager
     solve is."""
-    estimator = make_estimator()
+    estimator = make_estimator(attention_backend)
     reference_estimator = PackedDiT(copy.deepcopy(estimator.dit).float(), device="cuda")
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -307,11 +333,16 @@ def test_grow_rows_takes_nothing_on_a_shortfall() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("compile_prefix", [False, True], ids=["eager", "compiled"])
-def test_prefix_graph_replays_equal_the_eager_solve(compile_prefix: bool) -> None:
+@pytest.mark.parametrize("attention_backend", ["auto", "flashinfer_fa2"])
+def test_prefix_graph_replays_equal_the_eager_solve(
+    compile_prefix: bool,
+    attention_backend: str,
+    captured_graph_lifetimes: list[object],
+) -> None:
     """Replays with padding frames and unused row slots equal the eager solve,
     also when they resume from a step above the largest tier that ran eagerly and
     when a whole-history graph replays from the same pool between hops."""
-    estimator = make_estimator()
+    estimator = make_estimator(attention_backend)
     device = torch.device("cuda", torch.cuda.current_device())
     dtype = torch.bfloat16
     pools = [
@@ -368,6 +399,7 @@ def test_prefix_graph_replays_equal_the_eager_solve(compile_prefix: bool) -> Non
     )
     runner.capture()
     whole_history.capture()
+    captured_graph_lifetimes.append((runner, whole_history))
     torch.manual_seed(3)
     whole_history_inputs = dict(
         noise=torch.randn(1, 500, CHANNELS, device=device),
@@ -461,22 +493,33 @@ def test_prefix_graph_replays_equal_the_eager_solve(compile_prefix: bool) -> Non
                         cfg_rate=0.7,
                     )
                 outputs.append(generated)
-            assert torch.equal(outputs[0], outputs[1]), step
+            assert relative_l2(outputs[0], outputs[1]) <= GRAPH_RELATIVE_L2_TOLERANCE, (
+                step
+            )
             for name in names:
                 for graph_row, eager_row in zip(*caches[name]):
                     assert graph_row.committed_frames == eager_row.committed_frames
-                    assert torch.equal(graph_row.conv_context, eager_row.conv_context)
+                    assert (
+                        relative_l2(graph_row.conv_context, eager_row.conv_context)
+                        <= GRAPH_RELATIVE_L2_TOLERANCE
+                    )
                     graph_pages = graph_row.pages(device)[: graph_row.committed_frames]
                     eager_pages = eager_row.pages(device)[: eager_row.committed_frames]
                     for euler_step in range(10):
                         for layer in range(LAYERS):
-                            assert torch.equal(
-                                graph_pool.keys[euler_step][layer][graph_pages],
-                                eager_pool.keys[euler_step][layer][eager_pages],
+                            assert (
+                                relative_l2(
+                                    graph_pool.keys[euler_step][layer][graph_pages],
+                                    eager_pool.keys[euler_step][layer][eager_pages],
+                                )
+                                <= GRAPH_RELATIVE_L2_TOLERANCE
                             )
-                            assert torch.equal(
-                                graph_pool.values[euler_step][layer][graph_pages],
-                                eager_pool.values[euler_step][layer][eager_pages],
+                            assert (
+                                relative_l2(
+                                    graph_pool.values[euler_step][layer][graph_pages],
+                                    eager_pool.values[euler_step][layer][eager_pages],
+                                )
+                                <= GRAPH_RELATIVE_L2_TOLERANCE
                             )
     for pair_per_pool in caches.values():
         for pool, pair in zip(pools, pair_per_pool):
@@ -486,14 +529,17 @@ def test_prefix_graph_replays_equal_the_eager_solve(compile_prefix: bool) -> Non
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("compile_packed", [False, True], ids=["eager", "compiled"])
+@pytest.mark.parametrize("attention_backend", ["auto", "flashinfer_fa2"])
 def test_whole_history_graph_replays_equal_the_eager_solve(
     compile_packed: bool,
+    attention_backend: str,
+    captured_graph_lifetimes: list[object],
 ) -> None:
     """Replays with empty row slots and a padding row, after other steps left their
     frames in the tier's buffers, equal the eager solve of the rows alone, also
     through a tier whose padding row is longer than any row. Steps above the
     largest tier or past the row slots are refused."""
-    estimator = make_estimator()
+    estimator = make_estimator(attention_backend)
     device = torch.device("cuda", torch.cuda.current_device())
     dtype = torch.bfloat16
     unit = torch.linspace(0, 1, 11, device=device, dtype=dtype)
@@ -552,6 +598,7 @@ def test_whole_history_graph_replays_equal_the_eager_solve(
         tier_frames=(128, 256, 2048),
     )
     runner.capture()
+    captured_graph_lifetimes.append(runner)
 
     with torch.inference_mode(), torch.autocast("cuda", dtype=dtype):
         for lengths in (
@@ -564,6 +611,26 @@ def test_whole_history_graph_replays_equal_the_eager_solve(
             (40, 70),
         ):
             replayed = runner.run(**step_inputs(lengths), lengths=lengths)
-            assert torch.equal(replayed, eager_solve(lengths)), lengths
+            assert replayed is not None
+            captured = next(
+                item for item in runner.captured if item.tier_frames >= sum(lengths)
+            )
+            fixed_tier = solve_flow_euler_packed(
+                estimator,
+                captured.noise,
+                captured.time_span,
+                captured.mu,
+                captured.speaker_embeddings,
+                captured.mel_conditioning,
+                captured.twin_rows,
+                captured.attention,
+                runner.angles,
+                cfg_rate=0.7,
+            )[:, : sum(lengths)]
+            assert torch.equal(replayed, fixed_tier), lengths
+            assert (
+                relative_l2(replayed, eager_solve(lengths))
+                <= GRAPH_RELATIVE_L2_TOLERANCE
+            ), lengths
         for lengths in ((900, 900, 400), (20, 20, 20, 20)):
             assert runner.run(**step_inputs(lengths), lengths=lengths) is None

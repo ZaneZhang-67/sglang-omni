@@ -23,20 +23,20 @@ from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     CONV_CONTEXT_FRAMES,
     FA3_PAGE_SIZE,
     PACKED_INDUCTOR_OPTIONS,
+    STREAMING_FA3_SPLITS,
+    FlashInferAttentionRunner,
     PackedDiT,
     euler_step_times,
     modulate_block,
     modulate_final,
     packed_fa3,
+    packed_flashinfer_paged,
     ragged_fa3,
     rotate_in_place,
     rotated,
 )
 
 BLOCK_FRAMES = 64
-# note(ratish): FA3's pick for these segments with a tight page table; pinned, since a
-# graph's wider table would change the pick and the result.
-PREFIX_FA3_SPLITS = 1
 
 
 class PrefixForward(Protocol):
@@ -89,6 +89,7 @@ class PrefixKVPool:
         ]
         self.free_blocks: list[int] = list(range(block_count))
         self.device = device
+        self.dtype = dtype
         # Note (Jiaxin Deng): the compile warmup installs the compiled contract.
         self.forward: PrefixForward = forward_prefix
 
@@ -200,6 +201,10 @@ class PrefixRowAttention:
         padding_block: int,
         chunk_size: int,
         device: torch.device,
+        flashinfer_runner: FlashInferAttentionRunner | None = None,
+        heads: int | None = None,
+        head_dim: int | None = None,
+        dtype: torch.dtype | None = None,
     ) -> None:
         assert chunk_size <= BLOCK_FRAMES, "a padding segment reads one block"
         row_count = len(rows) // 2
@@ -235,9 +240,9 @@ class PrefixRowAttention:
             if block_row == padding_row:
                 pass
             else:
-                assert (
-                    rows[block_row].allocated_frames >= start_frame + length
-                ), "row holds fewer pages than frames"
+                assert rows[block_row].allocated_frames >= start_frame + length, (
+                    "row holds fewer pages than frames"
+                )
                 context_starts.append(extended_frames)
                 extended_frames += CONV_CONTEXT_FRAMES
             frame_starts.append(extended_frames)
@@ -330,9 +335,7 @@ class PrefixRowAttention:
             segment_ends_tensor,
             offsets_tensor,
             block_table,
-        ) = (
-            torch.cat(host_parts).to(device).split([len(part) for part in host_parts])
-        )
+        ) = torch.cat(host_parts).to(device).split([len(part) for part in host_parts])
         self.tail_index = tail_index.view(2 * row_slots, CONV_CONTEXT_FRAMES)
         block_table = block_table.view(len(block_lists), block_width)
         self.cache_seqlens = segment_ends_tensor.to(torch.int32)
@@ -351,6 +354,24 @@ class PrefixRowAttention:
         self.page_table = torch.where(
             page < segment_ends_tensor.unsqueeze(1), pages, 0
         ).to(torch.int32)
+        self.flashinfer_runner = flashinfer_runner
+        if flashinfer_runner is not None:
+            if heads is None or head_dim is None or dtype is None:
+                raise ValueError(
+                    "FlashInfer prefix attention requires heads, head_dim and dtype"
+                )
+            else:
+                pass
+            flashinfer_runner.plan_paged(
+                cu_seqlens_q=self.cu_seqlens_q,
+                cache_seqlens=self.cache_seqlens,
+                page_table=self.page_table,
+                heads=heads,
+                head_dim=head_dim,
+                dtype=dtype,
+            )
+        else:
+            pass
 
     def __call__(
         self,
@@ -367,20 +388,32 @@ class PrefixRowAttention:
         page_shape = (-1, FA3_PAGE_SIZE, head_num, head_dim)
         key_pool.index_copy_(0, self.write_index, key[0].reshape(page_shape))
         value_pool.index_copy_(0, self.write_index, value[0].reshape(page_shape))
-        if torch.compiler.is_compiling():
-            fa3 = packed_fa3
+        if self.flashinfer_runner is not None:
+            q = query[0].reshape(-1, head_num, head_dim)
+            if torch.compiler.is_compiling():
+                out = packed_flashinfer_paged(
+                    q,
+                    key_pool,
+                    value_pool,
+                    self.flashinfer_runner.runner_id,
+                )
+            else:
+                out = self.flashinfer_runner.run_paged(q, key_pool, value_pool)
         else:
-            fa3 = ragged_fa3
-        out = fa3(
-            query[0].reshape(-1, head_num, head_dim),
-            key_pool,
-            value_pool,
-            self.cache_seqlens,
-            self.page_table,
-            self.cu_seqlens_q,
-            self.max_seqlen_q,
-            PREFIX_FA3_SPLITS,
-        )
+            if torch.compiler.is_compiling():
+                fa3 = packed_fa3
+            else:
+                fa3 = ragged_fa3
+            out = fa3(
+                query[0].reshape(-1, head_num, head_dim),
+                key_pool,
+                value_pool,
+                self.cache_seqlens,
+                self.page_table,
+                self.cu_seqlens_q,
+                self.max_seqlen_q,
+                STREAMING_FA3_SPLITS,
+            )
         return out.reshape(1, -1, head_num * head_dim)
 
     def mark_dynamic(self) -> None:
@@ -614,6 +647,13 @@ def solve_flow_euler_prefix(
         padding_block=pool.padding_block,
         chunk_size=chunk_size,
         device=device,
+        flashinfer_runner=estimator.flashinfer_runner,
+        heads=estimator.dit.transformer_blocks[0].attn.heads,
+        head_dim=(
+            estimator.dit.transformer_blocks[0].attn.inner_dim
+            // estimator.dit.transformer_blocks[0].attn.heads
+        ),
+        dtype=pool.dtype,
     )
     angles, scale = estimator.dit.rotary_embed.forward_from_seq_len(max(end_frames))
     assert not isinstance(scale, torch.Tensor), "the DiT's RoPE has no xpos scale"

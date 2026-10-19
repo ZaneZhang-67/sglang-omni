@@ -5,18 +5,33 @@ along the sequence for every per token module, attention within each row."""
 from __future__ import annotations
 
 import logging
+import platform
+import sys
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
+from typing import Literal
+from weakref import WeakValueDictionary
 
 import torch
 import torch._dynamo as dynamo
 import torch.nn.functional as F
+
+if sys.platform == "darwin" and platform.machine() == "arm64":
+    BatchPrefillWithPagedKVCacheWrapper = None
+    BatchPrefillWithRaggedKVCacheWrapper = None
+else:
+    from flashinfer import (
+        BatchPrefillWithPagedKVCacheWrapper,
+        BatchPrefillWithRaggedKVCacheWrapper,
+    )
+
 from sglang.kernels.ops.attention.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
 from sglang.kernels.ops.attention.flash_attention_v3 import _is_fa3_supported
+from sglang.srt.environ import envs
 from sglang.srt.utils.custom_op import register_custom_op
 
 from sglang_omni.models.fun_cosyvoice3.causal_conv import FusedConvPositionEmbedding
@@ -29,6 +44,17 @@ CONV_CONTEXT_FRAMES = 30
 # note (ratish, chenyang): a row's chunks share a key prefix, so FA3 pages are one frame.
 FA3_PAGE_SIZE = 1
 FA3_DTYPES = (torch.float16, torch.bfloat16)
+# Whole-history and PrefixKV streaming calls must keep one reduction split: on
+# Ampere the SGLang FA3-compatible route otherwise changes its FA2 reduction
+# order when earlier query segments are omitted from a prefix hop.
+STREAMING_FA3_SPLITS = 1
+PackedAttentionBackend = Literal[
+    "auto", "sglang_fa3", "flashinfer_fa2", "flashinfer_auto", "sdpa"
+]
+FlashInferBackend = Literal["fa2", "auto"]
+PACKED_ATTENTION_BACKENDS = frozenset(
+    {"auto", "sglang_fa3", "flashinfer_fa2", "flashinfer_auto", "sdpa"}
+)
 # note(ratish): the first call benchmark runs at a warmup shape, not a serving one,
 # so its pick can change between boots; the heuristic config is the same on every boot.
 DIT_INDUCTOR_OPTIONS: dict[str, bool] = {"triton.autotune_pointwise": False}
@@ -36,6 +62,17 @@ PACKED_INDUCTOR_OPTIONS: dict[str, bool] = {
     **DIT_INDUCTOR_OPTIONS,
     "emulate_precision_casts": True,
 }
+
+
+def validate_packed_attention_backend(attention_backend: str) -> None:
+    if attention_backend not in PACKED_ATTENTION_BACKENDS:
+        supported = ", ".join(sorted(PACKED_ATTENTION_BACKENDS))
+        raise ValueError(
+            f"Unsupported PackedDiT attention backend {attention_backend!r}; "
+            f"expected one of: {supported}"
+        )
+    else:
+        pass
 
 
 def ragged_fa3(
@@ -93,6 +130,344 @@ packed_whole_row_fa3 = register_custom_op(
     mutates_args=[],
     out_shape="q",
 )
+
+
+_flashinfer_runners: WeakValueDictionary[int, FlashInferAttentionRunner] = (
+    WeakValueDictionary()
+)
+
+
+def flashinfer_runner_for_id(runner_id: int) -> FlashInferAttentionRunner:
+    runner = _flashinfer_runners.get(runner_id)
+    if runner is None:
+        raise RuntimeError(
+            f"FlashInfer attention runner {runner_id} is no longer alive"
+        )
+    else:
+        pass
+    return runner
+
+
+def run_flashinfer_paged(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    runner_id: int,
+) -> torch.Tensor:
+    return flashinfer_runner_for_id(runner_id).run_paged(q, k_cache, v_cache)
+
+
+packed_flashinfer_paged = register_custom_op(
+    run_flashinfer_paged,
+    op_name="fun_cosyvoice3_flashinfer_paged",
+    mutates_args=[],
+    out_shape="q",
+)
+
+
+def run_flashinfer_ragged(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    runner_id: int,
+) -> torch.Tensor:
+    return flashinfer_runner_for_id(runner_id).run_ragged(q, k, v)
+
+
+packed_flashinfer_ragged = register_custom_op(
+    run_flashinfer_ragged,
+    op_name="fun_cosyvoice3_flashinfer_ragged",
+    mutates_args=[],
+    out_shape="q",
+)
+
+
+class FlashInferAttentionRunner:
+    """One FlashInfer workspace and one plan per paged/ragged execution mode.
+
+    A Flow solve is serialized and reuses the selected plan across every DiT layer
+    and Euler step. Planning a new row layout replaces the preceding plan before
+    the next solve starts.
+    """
+
+    def __init__(
+        self,
+        device: torch.device,
+        *,
+        backend: FlashInferBackend,
+        workspace: torch.Tensor | None = None,
+        use_cuda_graph: bool = False,
+    ) -> None:
+        if (
+            BatchPrefillWithPagedKVCacheWrapper is None
+            or BatchPrefillWithRaggedKVCacheWrapper is None
+        ):
+            raise RuntimeError("FlashInfer is unavailable on this platform")
+        else:
+            pass
+        self.device = device
+        self.backend = backend
+        self.use_cuda_graph = use_cuda_graph
+        self.workspace = (
+            torch.empty(
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                dtype=torch.uint8,
+                device=device,
+            )
+            if workspace is None
+            else workspace
+        )
+        self.paged = (
+            None
+            if use_cuda_graph
+            else BatchPrefillWithPagedKVCacheWrapper(
+                self.workspace, "NHD", backend=backend
+            )
+        )
+        self.ragged = (
+            None
+            if use_cuda_graph
+            else BatchPrefillWithRaggedKVCacheWrapper(
+                self.workspace, "NHD", backend=backend
+            )
+        )
+        self.paged_qo_indptr: torch.Tensor | None = None
+        self.paged_kv_indptr: torch.Tensor | None = None
+        self.paged_kv_indices: torch.Tensor | None = None
+        self.paged_kv_last_page_len: torch.Tensor | None = None
+        self.ragged_qo_indptr: torch.Tensor | None = None
+        self.ragged_kv_indptr: torch.Tensor | None = None
+        self.paged_heads: int | None = None
+        self.paged_head_dim: int | None = None
+        self.paged_dtype: torch.dtype | None = None
+        self.ragged_heads: int | None = None
+        self.ragged_head_dim: int | None = None
+        self.ragged_dtype: torch.dtype | None = None
+        self.runner_id = id(self)
+        _flashinfer_runners[self.runner_id] = self
+
+    def cuda_graph_runner(self) -> FlashInferAttentionRunner:
+        if self.use_cuda_graph:
+            raise RuntimeError("a CUDA-graph FlashInfer runner cannot be cloned")
+        else:
+            pass
+        return FlashInferAttentionRunner(
+            self.device,
+            backend=self.backend,
+            workspace=self.workspace,
+            use_cuda_graph=True,
+        )
+
+    @staticmethod
+    def _paged_metadata(
+        cache_seqlens: torch.Tensor, page_table: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        paged_kv_indptr = F.pad(cache_seqlens.cumsum(0, dtype=torch.int32), (1, 0))
+        page_count = int(paged_kv_indptr[-1].item())
+        segment_ids = torch.repeat_interleave(
+            torch.arange(len(cache_seqlens), device=page_table.device),
+            cache_seqlens,
+            output_size=page_count,
+        )
+        page_positions = (
+            torch.arange(page_count, device=page_table.device)
+            - (paged_kv_indptr[segment_ids])
+        )
+        paged_kv_indices = page_table[segment_ids, page_positions].contiguous()
+        paged_kv_last_page_len = torch.ones_like(cache_seqlens)
+        return paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len
+
+    def plan_paged(
+        self,
+        *,
+        cu_seqlens_q: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        page_table: torch.Tensor,
+        heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+    ) -> None:
+        if not (
+            cu_seqlens_q.dtype == cache_seqlens.dtype == page_table.dtype == torch.int32
+        ):
+            raise TypeError("FlashInfer paged attention indices must all be int32")
+        else:
+            pass
+        paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len = (
+            self._paged_metadata(cache_seqlens, page_table)
+        )
+        if self.use_cuda_graph:
+            if self.paged is not None:
+                raise RuntimeError("FlashInfer paged graph runner is already planned")
+            else:
+                pass
+            self.paged_qo_indptr = torch.empty_like(cu_seqlens_q)
+            self.paged_kv_indptr = torch.empty_like(paged_kv_indptr)
+            self.paged_kv_indices = torch.empty(
+                page_table.numel(), dtype=torch.int32, device=page_table.device
+            )
+            self.paged_kv_last_page_len = torch.empty_like(paged_kv_last_page_len)
+            self.paged = BatchPrefillWithPagedKVCacheWrapper(
+                self.workspace,
+                "NHD",
+                use_cuda_graph=True,
+                qo_indptr_buf=self.paged_qo_indptr,
+                paged_kv_indptr_buf=self.paged_kv_indptr,
+                paged_kv_indices_buf=self.paged_kv_indices,
+                paged_kv_last_page_len_buf=self.paged_kv_last_page_len,
+                backend=self.backend,
+            )
+            self.paged_heads = heads
+            self.paged_head_dim = head_dim
+            self.paged_dtype = dtype
+        else:
+            pass
+        assert self.paged is not None
+        self.paged.plan(
+            cu_seqlens_q,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            heads,
+            heads,
+            head_dim,
+            FA3_PAGE_SIZE,
+            causal=False,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            disable_split_kv=True,
+        )
+
+    def update_paged(
+        self,
+        *,
+        cu_seqlens_q: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        page_table: torch.Tensor,
+    ) -> None:
+        if not self.use_cuda_graph or self.paged is None:
+            raise RuntimeError("FlashInfer paged graph runner is not planned")
+        else:
+            pass
+        paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len = (
+            self._paged_metadata(cache_seqlens, page_table)
+        )
+        assert (
+            self.paged_qo_indptr is not None
+            and self.paged_kv_indptr is not None
+            and self.paged_kv_indices is not None
+            and self.paged_kv_last_page_len is not None
+            and self.paged_heads is not None
+            and self.paged_head_dim is not None
+            and self.paged_dtype is not None
+        )
+        if len(paged_kv_indices) > len(self.paged_kv_indices):
+            raise ValueError(
+                "FlashInfer paged graph metadata exceeds its captured capacity"
+            )
+        else:
+            pass
+        self.paged.plan(
+            cu_seqlens_q,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            self.paged_heads,
+            self.paged_heads,
+            self.paged_head_dim,
+            FA3_PAGE_SIZE,
+            causal=False,
+            q_data_type=self.paged_dtype,
+            kv_data_type=self.paged_dtype,
+            disable_split_kv=True,
+        )
+
+    def plan_ragged(
+        self,
+        *,
+        cu_seqlens: torch.Tensor,
+        heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+    ) -> None:
+        if cu_seqlens.dtype != torch.int32:
+            raise TypeError("FlashInfer ragged attention indices must be int32")
+        else:
+            pass
+        if self.use_cuda_graph:
+            if self.ragged is not None:
+                raise RuntimeError("FlashInfer ragged graph runner is already planned")
+            else:
+                pass
+            self.ragged_qo_indptr = torch.empty_like(cu_seqlens)
+            self.ragged_kv_indptr = torch.empty_like(cu_seqlens)
+            self.ragged = BatchPrefillWithRaggedKVCacheWrapper(
+                self.workspace,
+                "NHD",
+                use_cuda_graph=True,
+                qo_indptr_buf=self.ragged_qo_indptr,
+                kv_indptr_buf=self.ragged_kv_indptr,
+                backend=self.backend,
+            )
+            self.ragged_heads = heads
+            self.ragged_head_dim = head_dim
+            self.ragged_dtype = dtype
+        else:
+            pass
+        assert self.ragged is not None
+        self.ragged.plan(
+            cu_seqlens,
+            cu_seqlens,
+            heads,
+            heads,
+            head_dim,
+            causal=False,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            disable_split_kv=self.use_cuda_graph,
+        )
+
+    def update_ragged(self, *, cu_seqlens: torch.Tensor) -> None:
+        if not self.use_cuda_graph or self.ragged is None:
+            raise RuntimeError("FlashInfer ragged graph runner is not planned")
+        else:
+            pass
+        assert (
+            self.ragged_qo_indptr is not None
+            and self.ragged_kv_indptr is not None
+            and self.ragged_heads is not None
+            and self.ragged_head_dim is not None
+            and self.ragged_dtype is not None
+        )
+        self.ragged.plan(
+            cu_seqlens,
+            cu_seqlens,
+            self.ragged_heads,
+            self.ragged_heads,
+            self.ragged_head_dim,
+            causal=False,
+            q_data_type=self.ragged_dtype,
+            kv_data_type=self.ragged_dtype,
+            disable_split_kv=True,
+        )
+
+    def run_paged(
+        self, q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor
+    ) -> torch.Tensor:
+        if self.paged is None:
+            raise RuntimeError("FlashInfer paged runner is not planned")
+        else:
+            pass
+        return self.paged.run(q, (k_cache, v_cache))
+
+    def run_ragged(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        if self.ragged is None:
+            raise RuntimeError("FlashInfer ragged runner is not planned")
+        else:
+            pass
+        return self.ragged.run(q, k, v)
 
 
 @dataclass(frozen=True)
@@ -268,6 +643,7 @@ class RaggedRowAttention:
             self.page_table,
             self.cu_seqlens_q,
             self.max_seqlen_q,
+            STREAMING_FA3_SPLITS,
         )
         return out.reshape(1, -1, self.heads * self.head_dim)
 
@@ -304,7 +680,87 @@ class WholeRowAttention:
         return out.reshape(1, -1, self.heads * self.head_dim)
 
 
-PackedRowAttention = RowAttention | RaggedRowAttention | WholeRowAttention
+class FlashInferPagedRowAttention(RaggedRowAttention):
+    """Chunk-causal packed rows through FlashInfer's page-size-one KV layout."""
+
+    def __init__(
+        self,
+        rows: PackedRows,
+        *,
+        chunk_size: int,
+        heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        runner: FlashInferAttentionRunner,
+    ) -> None:
+        super().__init__(rows, chunk_size=chunk_size, heads=heads, head_dim=head_dim)
+        self.runner = runner
+        runner.plan_paged(
+            cu_seqlens_q=self.cu_seqlens_q,
+            cache_seqlens=self.cache_seqlens,
+            page_table=self.page_table,
+            heads=heads,
+            head_dim=head_dim,
+            dtype=dtype,
+        )
+
+    def __call__(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> torch.Tensor:
+        page_shape = (-1, FA3_PAGE_SIZE, self.heads, self.head_dim)
+        q = query[0].reshape(-1, self.heads, self.head_dim)
+        k = key[0].reshape(page_shape)
+        v = value[0].reshape(page_shape)
+        if torch.compiler.is_compiling():
+            out = packed_flashinfer_paged(q, k, v, self.runner.runner_id)
+        else:
+            out = self.runner.run_paged(q, k, v)
+        return out.reshape(1, -1, self.heads * self.head_dim)
+
+
+class FlashInferWholeRowAttention(WholeRowAttention):
+    """Bidirectional packed rows through FlashInfer ragged prefill."""
+
+    def __init__(
+        self,
+        rows: PackedRows,
+        *,
+        heads: int,
+        head_dim: int,
+        max_frames: int,
+        dtype: torch.dtype,
+        runner: FlashInferAttentionRunner,
+    ) -> None:
+        super().__init__(rows, heads=heads, head_dim=head_dim, max_frames=max_frames)
+        self.runner = runner
+        runner.plan_ragged(
+            cu_seqlens=self.cu_seqlens,
+            heads=heads,
+            head_dim=head_dim,
+            dtype=dtype,
+        )
+
+    def __call__(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> torch.Tensor:
+        head_shape = (-1, self.heads, self.head_dim)
+        q = query[0].reshape(head_shape)
+        k = key[0].reshape(head_shape)
+        v = value[0].reshape(head_shape)
+        if torch.compiler.is_compiling():
+            out = packed_flashinfer_ragged(q, k, v, self.runner.runner_id)
+        else:
+            out = self.runner.run_ragged(q, k, v)
+        return out.reshape(1, -1, self.heads * self.head_dim)
+
+
+PackedRowAttention = (
+    RowAttention
+    | RaggedRowAttention
+    | WholeRowAttention
+    | FlashInferPagedRowAttention
+    | FlashInferWholeRowAttention
+)
 
 
 class PackedDiT:
@@ -315,10 +771,51 @@ class PackedDiT:
     block_modulations: tuple[tuple[torch.nn.Parameter, ...], ...]
     final_modulations: tuple[torch.nn.Parameter, ...]
 
-    def __init__(self, dit: torch.nn.Module, *, device: str | torch.device) -> None:
+    def __init__(
+        self,
+        dit: torch.nn.Module,
+        *,
+        device: str | torch.device,
+        attention_backend: PackedAttentionBackend = "auto",
+    ) -> None:
         self.dit = dit
         device = torch.device(device)
-        self.is_ragged = device.type == "cuda" and _is_fa3_supported()
+        validate_packed_attention_backend(attention_backend)
+        self.requested_attention_backend = attention_backend
+        if attention_backend == "auto":
+            resolved_backend = (
+                "sglang_fa3"
+                if device.type == "cuda" and _is_fa3_supported(device)
+                else "sdpa"
+            )
+        else:
+            resolved_backend = attention_backend
+        if resolved_backend == "sglang_fa3":
+            if not (device.type == "cuda" and _is_fa3_supported(device)):
+                raise RuntimeError(
+                    f"attention_backend='sglang_fa3' is unavailable on {device}"
+                )
+            else:
+                pass
+        elif resolved_backend.startswith("flashinfer_"):
+            if device.type != "cuda":
+                raise RuntimeError(
+                    f"attention_backend={resolved_backend!r} requires a CUDA device"
+                )
+            else:
+                pass
+        else:
+            pass
+        self.attention_backend = resolved_backend
+        self.flashinfer_runner = (
+            FlashInferAttentionRunner(
+                device,
+                backend=("fa2" if resolved_backend == "flashinfer_fa2" else "auto"),
+            )
+            if resolved_backend.startswith("flashinfer_")
+            else None
+        )
+        self.is_ragged = resolved_backend != "sdpa"
         self.is_compiled = False
         # note (ratish): Parameters, whose shapes Dynamo keeps static under the dynamic
         # prefix compile. to_q, to_k and to_v become row views of them, so the DiT
@@ -352,10 +849,12 @@ class PackedDiT:
         self.qkv_weights = tuple(qkv_weights)
         self.qkv_biases = tuple(qkv_biases)
         logger.info(
-            "Fun-CosyVoice3 Flow row attention on %s: %s",
-            device,
-            "ragged FA3" if self.is_ragged else "padded SDPA",
+            f"Fun-CosyVoice3 Flow row attention on {device}: {self.attention_backend}"
         )
+
+    @property
+    def uses_flashinfer(self) -> bool:
+        return self.flashinfer_runner is not None
 
     @property
     def chunk_size(self) -> int:
@@ -392,16 +891,64 @@ class PackedDiT:
         self.final_modulations = tuple(final_modulations)
 
     def row_attention(
-        self, rows: PackedRows, *, streaming: bool, dtype: torch.dtype
+        self,
+        rows: PackedRows,
+        *,
+        streaming: bool,
+        dtype: torch.dtype,
+        flashinfer_runner: FlashInferAttentionRunner | None = None,
     ) -> PackedRowAttention:
         attention = self.dit.transformer_blocks[0].attn
         heads = attention.heads
         head_dim = attention.inner_dim // heads
-        row_attention: RaggedRowAttention | WholeRowAttention
-        if not self.is_ragged or dtype not in FA3_DTYPES:
+        row_attention: (
+            RaggedRowAttention
+            | WholeRowAttention
+            | FlashInferPagedRowAttention
+            | FlashInferWholeRowAttention
+        )
+        selected_flashinfer_runner = (
+            self.flashinfer_runner if flashinfer_runner is None else flashinfer_runner
+        )
+        if not self.is_ragged:
             return RowAttention(
                 rows, chunk_size=self.chunk_size if streaming else None, heads=heads
             )
+        elif dtype not in FA3_DTYPES:
+            if self.requested_attention_backend != "auto":
+                raise TypeError(
+                    f"attention_backend={self.attention_backend!r} requires float16 "
+                    f"or bfloat16, got {dtype}"
+                )
+            else:
+                pass
+            return RowAttention(
+                rows, chunk_size=self.chunk_size if streaming else None, heads=heads
+            )
+        elif selected_flashinfer_runner is not None and streaming:
+            row_attention = FlashInferPagedRowAttention(
+                rows,
+                chunk_size=self.chunk_size,
+                heads=heads,
+                head_dim=head_dim,
+                dtype=dtype,
+                runner=selected_flashinfer_runner,
+            )
+            dynamic_dims = [
+                (row_attention.page_table, (0, 1)),
+                (row_attention.cu_seqlens_q, 0),
+                (row_attention.cache_seqlens, 0),
+            ]
+        elif selected_flashinfer_runner is not None:
+            row_attention = FlashInferWholeRowAttention(
+                rows,
+                heads=heads,
+                head_dim=head_dim,
+                max_frames=rows.width,
+                dtype=dtype,
+                runner=selected_flashinfer_runner,
+            )
+            dynamic_dims = [(row_attention.cu_seqlens, 0)]
         elif streaming:
             row_attention = RaggedRowAttention(
                 rows, chunk_size=self.chunk_size, heads=heads, head_dim=head_dim

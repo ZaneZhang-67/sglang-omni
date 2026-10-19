@@ -47,7 +47,9 @@ from sglang_omni.models.fun_cosyvoice3.causal_conv import (
     HAS_TRITON,
     FusedConvPositionEmbedding,
 )
-from sglang_omni.models.fun_cosyvoice3.config import reject_conflicting_dit_accelerators
+from sglang_omni.models.fun_cosyvoice3.config import (
+    reject_conflicting_dit_accelerators,
+)
 from sglang_omni.models.fun_cosyvoice3.flow_estimator_trt import (
     execute_flow_estimator,
     is_flow_estimator_trt,
@@ -67,6 +69,7 @@ from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     pack_rows,
     scatter_rows,
     solve_flow_euler_packed,
+    validate_packed_attention_backend,
 )
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
 from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
@@ -1114,8 +1117,7 @@ def attach_flow_estimator_trt(
 
     if str(device).split(":", 1)[0].lower() != "cuda":
         raise RuntimeError(
-            "enable_flow_estimator_trt requires a CUDA vocoder device, "
-            f"got {device!r}"
+            f"enable_flow_estimator_trt requires a CUDA vocoder device, got {device!r}"
         )
     else:
         pass
@@ -1154,9 +1156,14 @@ def load_cosyvoice3_flow_hift(
     *,
     autocast_dtype: torch.dtype | None,
     enable_flow_estimator_trt: bool = False,
+    flow_attention_backend: str = "auto",
 ) -> "tuple[FunCosyVoice3Flow, CausalHiFTGenerator | MpsHiFTAdapter]":
     if torch.device(device).type == "mps":
-        return load_cosyvoice3_flow_hift_lightweight(checkpoint_dir, device=device)
+        return load_cosyvoice3_flow_hift_lightweight(
+            checkpoint_dir,
+            device=device,
+            flow_attention_backend=flow_attention_backend,
+        )
     else:
         pass
     # note (db-ol): the first modelscope import sets every root StreamHandler
@@ -1222,7 +1229,12 @@ def load_cosyvoice3_flow_hift(
     else:
         pass
     wrapped = FunCosyVoice3Flow(
-        flow, packed_estimator=PackedDiT(flow.decoder.estimator, device=device)
+        flow,
+        packed_estimator=PackedDiT(
+            flow.decoder.estimator,
+            device=device,
+            attention_backend=flow_attention_backend,
+        ),
     )
     if enable_flow_estimator_trt:
         attach_flow_estimator_trt(wrapped, checkpoint_dir, device)
@@ -1396,6 +1408,7 @@ def load_cosyvoice3_flow_hift_lightweight(
     checkpoint_dir: str,
     *,
     device: str,
+    flow_attention_backend: str = "auto",
 ) -> "tuple[FunCosyVoice3Flow, CausalHiFTGenerator | MpsHiFTAdapter]":
     """Load only Flow and HiFT for CPU/MPS without constructing a second LLM."""
     try:
@@ -1445,7 +1458,12 @@ def load_cosyvoice3_flow_hift_lightweight(
     del configs
     return (
         FunCosyVoice3Flow(
-            flow, packed_estimator=PackedDiT(flow.decoder.estimator, device=device)
+            flow,
+            packed_estimator=PackedDiT(
+                flow.decoder.estimator,
+                device=device,
+                attention_backend=flow_attention_backend,
+            ),
         ),
         hift,
     )
@@ -1458,7 +1476,6 @@ def compile_dit_backbone(
     warmup_steps: int = 3,
     autocast_dtype: torch.dtype | None = None,
 ) -> None:
-
     estimator = flow.decoder.estimator
     if not isinstance(estimator, torch.nn.Module):
         raise RuntimeError(
@@ -2205,14 +2222,14 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
                 window_source[
                     index,
                     :,
-                    (window.start_frame - origin)
-                    * samples_per_frame : (history_frames - origin)
+                    (window.start_frame - origin) * samples_per_frame : (
+                        history_frames - origin
+                    )
                     * samples_per_frame,
                 ] = excitation[
                     index - first,
                     :,
-                    window.start_frame
-                    * samples_per_frame : history_frames
+                    window.start_frame * samples_per_frame : history_frames
                     * samples_per_frame,
                 ]
         if frame_tier is None:
@@ -2224,8 +2241,9 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
             (
                 speech[
                     index : index + 1,
-                    (window.emitted_frame - origin)
-                    * samples_per_frame : (window.end_frame - origin)
+                    (window.emitted_frame - origin) * samples_per_frame : (
+                        window.end_frame - origin
+                    )
                     * samples_per_frame,
                 ].contiguous(),
                 window.end_frame * samples_per_frame,
@@ -2379,6 +2397,7 @@ def create_vocoder_executor(
     token_max_hop_len: int = TOKEN_MAX_HOP_LEN,
     disable_hop_growth: bool = False,
     flow_prefix_cache_gb: float,
+    flow_attention_backend: str = "auto",
 ) -> FunCosyVoice3StreamingVocoderScheduler:
     from sglang_omni.models.fun_cosyvoice3.streaming_vocoder import (
         FunCosyVoice3StreamingVocoderScheduler,
@@ -2397,6 +2416,7 @@ def create_vocoder_executor(
         enable_dit_torch_compile=enable_dit_torch_compile,
         enable_flow_estimator_trt=enable_flow_estimator_trt,
     )
+    validate_packed_attention_backend(flow_attention_backend)
     device = str(resolve_concrete_device(device, gpu_id))
 
     max_batch_size = 16 if max_batch_size is None else int(max_batch_size)
@@ -2425,6 +2445,7 @@ def create_vocoder_executor(
         fp16=(dtype == "float16"),
         autocast_dtype=autocast_dtype,
         enable_flow_estimator_trt=enable_flow_estimator_trt,
+        flow_attention_backend=flow_attention_backend,
     )
 
     device_obj = torch.device(device)

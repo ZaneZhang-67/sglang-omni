@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Iterator
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,9 @@ from sglang_omni.models.fun_cosyvoice3.causal_conv import (
     pack_group_conv_weight,
 )
 from sglang_omni.models.fun_cosyvoice3.packed_dit import (
+    FlashInferAttentionRunner,
+    FlashInferPagedRowAttention,
+    FlashInferWholeRowAttention,
     PackedDiT,
     PackedRows,
     RaggedRowAttention,
@@ -29,7 +33,9 @@ from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     scatter_rows,
     solve_flow_euler_packed,
 )
+from sglang_omni.models.fun_cosyvoice3.solve_graph_capture import SolveGraphCapture
 from sglang_omni.models.fun_cosyvoice3.stages import solve_flow_euler
+from sglang_omni.platforms import current_platform
 
 cosyvoice_dit = pytest.importorskip("cosyvoice.flow.DiT.dit")
 cosyvoice_mask = pytest.importorskip("cosyvoice.utils.mask")
@@ -64,6 +70,13 @@ def tiny_dit() -> torch.nn.Module:
         for parameter in dit.parameters():
             parameter.normal_(0, 0.3)
     return dit.eval()
+
+
+def test_explicit_attention_backends_do_not_fall_back() -> None:
+    with pytest.raises(ValueError, match="Unsupported PackedDiT attention backend"):
+        PackedDiT(tiny_dit(), device=CPU, attention_backend="unknown")
+    with pytest.raises(RuntimeError, match="requires a CUDA device"):
+        PackedDiT(tiny_dit(), device=CPU, attention_backend="flashinfer_fa2")
 
 
 def padded_inputs() -> dict[str, torch.Tensor]:
@@ -430,6 +443,149 @@ def test_the_ragged_read_matches_the_padded_read(
     ragged = attention(query, key, value)
     padded = RowAttention(rows, chunk_size=chunk_size, heads=heads)(query, key, value)
     torch.testing.assert_close(ragged, padded, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("flashinfer_backend", ["fa2", "auto"])
+@pytest.mark.parametrize("chunk_size", [CHUNK, None])
+def test_the_flashinfer_read_matches_the_padded_read(
+    flashinfer_backend: str, chunk_size: int | None
+) -> None:
+    device = torch.device("cuda")
+    torch.manual_seed(2)
+    heads = 2
+    head_dim = 64
+    rows = pack_rows((*LENGTHS[:2], 0, *LENGTHS[2:]), device)
+    query, key, value = (
+        torch.randn(
+            1, rows.total, heads * head_dim, device=device, dtype=torch.bfloat16
+        )
+        for _ in range(3)
+    )
+    runner = FlashInferAttentionRunner(device, backend=flashinfer_backend)
+    if chunk_size is None:
+        attention = FlashInferWholeRowAttention(
+            rows,
+            heads=heads,
+            head_dim=head_dim,
+            max_frames=rows.width,
+            dtype=query.dtype,
+            runner=runner,
+        )
+    else:
+        attention = FlashInferPagedRowAttention(
+            rows,
+            chunk_size=chunk_size,
+            heads=heads,
+            head_dim=head_dim,
+            dtype=query.dtype,
+            runner=runner,
+        )
+    actual = attention(query, key, value)
+    expected = RowAttention(rows, chunk_size=chunk_size, heads=heads)(query, key, value)
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("mode", ["paged", "ragged"])
+def test_flashinfer_graph_runner_replans_fixed_metadata_buffers(
+    mode: str, flashinfer_graph_lifetimes: list[object]
+) -> None:
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    heads, head_dim = 2, 64
+    torch.manual_seed(3)
+    eager = FlashInferAttentionRunner(device, backend="fa2")
+    graph_runner = eager.cuda_graph_runner()
+
+    if mode == "paged":
+        query = torch.randn(5, heads, head_dim, device=device, dtype=dtype)
+        key = torch.randn(16, 1, heads, head_dim, device=device, dtype=dtype)
+        value = torch.randn_like(key)
+        cu_seqlens_q = torch.tensor([0, 2, 5], device=device, dtype=torch.int32)
+        capture_lengths = torch.tensor([3, 4], device=device, dtype=torch.int32)
+        replay_lengths = torch.tensor([5, 2], device=device, dtype=torch.int32)
+        capture_pages = torch.tensor(
+            [[0, 1, 2, 0, 0, 0, 0, 0], [4, 5, 6, 7, 0, 0, 0, 0]],
+            device=device,
+            dtype=torch.int32,
+        )
+        replay_pages = torch.tensor(
+            [[8, 9, 10, 11, 12, 0, 0, 0], [13, 14, 0, 0, 0, 0, 0, 0]],
+            device=device,
+            dtype=torch.int32,
+        )
+        graph_runner.plan_paged(
+            cu_seqlens_q=cu_seqlens_q,
+            cache_seqlens=capture_lengths,
+            page_table=capture_pages,
+            heads=heads,
+            head_dim=head_dim,
+            dtype=dtype,
+        )
+        run = lambda: graph_runner.run_paged(query, key, value)
+    else:
+        query, key, value = (
+            torch.randn(7, heads, head_dim, device=device, dtype=dtype)
+            for _ in range(3)
+        )
+        capture_cu_seqlens = torch.tensor([0, 3, 7], device=device, dtype=torch.int32)
+        replay_cu_seqlens = torch.tensor([0, 5, 7], device=device, dtype=torch.int32)
+        graph_runner.plan_ragged(
+            cu_seqlens=capture_cu_seqlens,
+            heads=heads,
+            head_dim=head_dim,
+            dtype=dtype,
+        )
+        run = lambda: graph_runner.run_ragged(query, key, value)
+
+    backend = current_platform.get_device_graph_backend(device)
+    assert backend is not None
+    graph, output = SolveGraphCapture(
+        backend, device=device, autocast_dtype=None
+    ).capture(run, autocast=False)
+
+    if mode == "paged":
+        graph_runner.update_paged(
+            cu_seqlens_q=cu_seqlens_q,
+            cache_seqlens=replay_lengths,
+            page_table=replay_pages,
+        )
+        eager.plan_paged(
+            cu_seqlens_q=cu_seqlens_q,
+            cache_seqlens=replay_lengths,
+            page_table=replay_pages,
+            heads=heads,
+            head_dim=head_dim,
+            dtype=dtype,
+        )
+        expected = eager.run_paged(query, key, value)
+    else:
+        graph_runner.update_ragged(cu_seqlens=replay_cu_seqlens)
+        eager.plan_ragged(
+            cu_seqlens=replay_cu_seqlens,
+            heads=heads,
+            head_dim=head_dim,
+            dtype=dtype,
+        )
+        expected = eager.run_ragged(query, key, value)
+    graph.replay()
+    assert torch.equal(output, expected)
+    flashinfer_graph_lifetimes.append(
+        (graph, graph_runner, eager, output, expected, query, key, value)
+    )
+
+
+@pytest.fixture(scope="module")
+def flashinfer_graph_lifetimes() -> Iterator[list[object]]:
+    retained: list[object] = []
+    yield retained
+    for state in retained:
+        state[0].reset()
+    torch.cuda.synchronize()
+    retained.clear()
 
 
 @pytest.mark.accelerator
